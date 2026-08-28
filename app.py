@@ -64,7 +64,7 @@ _rr = None
 _meta = {}
 _heads = OrderedDict()          # (peer, msg_id) -> bytes (first HEAD_MB)
 _head_locks = {}
-_stats = {'requests': 0, 'head_hits': 0, 'meta_hits': 0}
+_stats = {'requests': 0, 'head_hits': 0, 'meta_hits': 0, 'parallel_heads': 0}
 
 
 def _peer(value):
@@ -232,6 +232,42 @@ async def _aligned_read(worker, peer, msg_id, media, start, want):
             skip = start - base
 
 
+async def _parallel_head(peer, msg_id, size, want):
+    """Fetch the opening `want` bytes using SEVERAL bots at once.
+
+    Research (FastTelethon / mautrix-telegram parallel_file_transfer, plus
+    core.telegram.org/api/files) shows a single MTProto sender is the throughput
+    ceiling: the reference implementation opens up to 20 senders per file and
+    strides their offsets. We do the same shape with the bots we already have -
+    each bot fetches a different 1 MB-aligned slice concurrently, then the
+    slices are concatenated in order. No extra accounts needed.
+    """
+    live = [c for c in clients if c.is_connected()]
+    if not live:
+        raise RuntimeError('no workers')
+    slices = []
+    off = 0
+    while off < want:
+        n = min(ALIGN, want - off)
+        slices.append((off, n))
+        off += n
+    workers = (live * ((len(slices) // len(live)) + 1))[:len(slices)]
+
+    async def one(w, start, length):
+        media, _, _, _ = await _media(w, peer, msg_id)
+        if media is None:
+            raise RuntimeError('not found')
+        buf = bytearray()
+        async for chunk in _aligned_read(w, peer, msg_id, media, start, length):
+            buf += chunk
+            if len(buf) >= length:
+                break
+        return bytes(buf[:length])
+
+    parts = await asyncio.gather(*[one(w, s, n) for w, (s, n) in zip(workers, slices)])
+    return b''.join(parts)
+
+
 async def _get_head(worker, peer, msg_id, media, size):
     """Cache the first HEAD_MB of a file: ftyp + moov (5-7 MB here) + opening
     seconds. This is what removes the wait before the first frame.
@@ -252,15 +288,22 @@ async def _get_head(worker, peer, msg_id, media, size):
         if cached is not None:
             return cached
         want = min(HEAD_MB * MB, size)
-        buf = bytearray()
-        async for chunk in _aligned_read(worker, peer, msg_id, media, 0, want):
-            buf += chunk
-        data = bytes(buf)
+        try:
+            data = await _parallel_head(peer, msg_id, size, want)
+            _stats['parallel_heads'] += 1
+        except Exception as e:
+            log.info('parallel head failed (%s), falling back to single sender',
+                     type(e).__name__)
+            buf = bytearray()
+            async for chunk in _aligned_read(worker, peer, msg_id, media, 0, want):
+                buf += chunk
+            data = bytes(buf)
         _heads[key] = data
         while len(_heads) > HEAD_FILES:
             _heads.popitem(last=False)
         _head_locks.pop(key, None)
         return data
+
 
 
 @app.api_route('/stream/{msg_id}', methods=['GET', 'HEAD'])
