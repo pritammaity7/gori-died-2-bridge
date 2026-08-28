@@ -34,7 +34,7 @@ from itertools import cycle
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
-from telethon import TelegramClient, connection
+from telethon import TelegramClient, connection, errors
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('bridge')
@@ -162,11 +162,20 @@ async def health():
                         status_code=200 if ok else 503)
 
 
-async def _media(worker, peer, msg_id):
-    """(media, size, mime, filename), cached for META_TTL."""
-    key = (str(peer), msg_id)
+async def _media(worker, peer, msg_id, force=False):
+    """(media, size, mime, filename), cached PER BOT.
+
+    Critical: a media object is only valid for the account that fetched it.
+    Telegram's docs are explicit - "the access_hash will always be the same for
+    a given account, but different accounts will each see their own, different
+    access_hash... it is impossible to get a media object from one account and
+    use it in another". file_reference also expires after a few hours.
+    So the cache key includes the worker, and callers retry with force=True on
+    FileReferenceExpiredError.
+    """
+    key = (id(worker), str(peer), msg_id)
     hit = _meta.get(key)
-    if hit and time.time() - hit[0] < META_TTL:
+    if hit and not force and time.time() - hit[0] < META_TTL:
         _stats['meta_hits'] += 1
         return hit[1], hit[2], hit[3], hit[4]
 
@@ -186,32 +195,49 @@ async def _media(worker, peer, msg_id):
     return media, size, mime, name
 
 
-async def _aligned_read(worker, media, start, want):
+
+async def _aligned_read(worker, peer, msg_id, media, start, want):
     """Read `want` bytes from `start`, honouring Telegram's 1 MB chunk rule.
 
     Telegram requires the requested part to sit within a single 1 MB chunk, so
     we floor the offset to a 1 MB boundary and drop the leading bytes.
+    A stale file_reference is refreshed once and the read restarts.
     """
     base = (start // ALIGN) * ALIGN
     skip = start - base
     sent = 0
-    async for chunk in worker.iter_download(media, offset=base, request_size=CHUNK):
-        if skip:
-            if len(chunk) <= skip:
-                skip -= len(chunk)
-                continue
-            chunk = chunk[skip:]
-            skip = 0
-        if sent + len(chunk) >= want:
-            yield chunk[:want - sent]
+    for attempt in (0, 1):
+        try:
+            async for chunk in worker.iter_download(media, offset=base, request_size=CHUNK):
+                if skip:
+                    if len(chunk) <= skip:
+                        skip -= len(chunk)
+                        continue
+                    chunk = chunk[skip:]
+                    skip = 0
+                if sent + len(chunk) >= want:
+                    yield chunk[:want - sent]
+                    return
+                yield chunk
+                sent += len(chunk)
             return
-        yield chunk
-        sent += len(chunk)
+        except errors.FileReferenceExpiredError:
+            if attempt or sent:
+                raise
+            log.info('file_reference expired for %s, refreshing', msg_id)
+            media, _, _, _ = await _media(worker, peer, msg_id, force=True)
+            if media is None:
+                raise
+            skip = start - base
 
 
 async def _get_head(worker, peer, msg_id, media, size):
     """Cache the first HEAD_MB of a file: ftyp + moov (5-7 MB here) + opening
-    seconds. This is what removes the wait before the first frame."""
+    seconds. This is what removes the wait before the first frame.
+
+    Keyed by peer+msg only - the bytes are account-independent even though the
+    media object is not, so one fetch serves every bot in the pool.
+    """
     key = (str(peer), msg_id)
     cached = _heads.get(key)
     if cached is not None:
@@ -226,12 +252,16 @@ async def _get_head(worker, peer, msg_id, media, size):
             return cached
         want = min(HEAD_MB * MB, size)
         buf = bytearray()
-        async for chunk in _aligned_read(worker, media, 0, want):
+        async for chunk in _aligned_read(worker, peer, msg_id, media, 0, want):
             buf += chunk
         data = bytes(buf)
         _heads[key] = data
         while len(_heads) > HEAD_FILES:
             _heads.popitem(last=False)
+        _head_locks.pop(key, None)
+        return data
+
+
 @app.api_route('/stream/{msg_id}', methods=['GET', 'HEAD'])
 async def stream(msg_id: int, request: Request, peer: str = '', token: str = '',
                  dl: int = 0):
@@ -290,11 +320,12 @@ async def stream(msg_id: int, request: Request, peer: str = '', token: str = '',
             served = min(want, len(head) - start)
             if served >= want:
                 return
-            async for chunk in _aligned_read(worker, media, start + served, want - served):
+            async for chunk in _aligned_read(worker, target, msg_id, media,
+                                             start + served, want - served):
                 yield chunk
             return
         try:
-            async for chunk in _aligned_read(worker, media, start, want):
+            async for chunk in _aligned_read(worker, target, msg_id, media, start, want):
                 yield chunk
         except Exception as e:
             log.info('stream %s ended: %s', msg_id, type(e).__name__)
