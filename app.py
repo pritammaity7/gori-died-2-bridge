@@ -317,8 +317,12 @@ async def stream(msg_id: int, request: Request, peer: str = '', token: str = '',
         return Response(status_code=416, headers={**base, 'Content-Range': f'bytes */{size}'})
     want = end - start + 1
 
+    # Serve the opening bytes from the in-memory head whenever the request
+    # starts inside that window - including a plain full-file GET, which is what
+    # a browser issues first. Previously this only applied to small ranges, so
+    # the common case still waited on Telegram.
     head = None
-    if start + want <= HEAD_MB * MB:
+    if start < HEAD_MB * MB:
         try:
             head = await _get_head(worker, target, msg_id, media, size)
         except Exception as e:
