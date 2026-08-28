@@ -30,6 +30,7 @@ import re
 import time
 from collections import OrderedDict
 from itertools import cycle
+from urllib.parse import quote
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -284,11 +285,20 @@ async def stream(msg_id: int, request: Request, peer: str = '', token: str = '',
     if media is None:
         return Response('file not found', status_code=404)
 
-    fname = (name or f'file_{msg_id}').replace('"', '')
+    # HTTP headers must be latin-1 encodable. Many files here have emoji and
+    # non-Latin characters in their names (e.g. "MAURYAN EMPIRE BY VIVID ..."),
+    # which made uvicorn raise while writing the response -> HTTP 500.
+    # RFC 5987 filename* carries the real name safely; filename= keeps an ASCII
+    # fallback for old clients.
+    raw_name = name or f'file_{msg_id}'
+    ascii_name = raw_name.encode('ascii', 'ignore').decode().replace('"', '').strip() \
+        or f'file_{msg_id}'
+    disp = 'attachment' if dl else 'inline'
     base = {
         'Accept-Ranges': 'bytes',
         'Content-Type': mime,
-        'Content-Disposition': f'{"attachment" if dl else "inline"}; filename="{fname}"',
+        'Content-Disposition': (f'{disp}; filename="{ascii_name}"; '
+                                f"filename*=UTF-8''{quote(raw_name)}"),
         'Cache-Control': 'public, max-age=86400',
     }
     if request.method == 'HEAD':
