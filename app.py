@@ -24,6 +24,8 @@ Env: API_ID, API_HASH, BOT_TOKENS (comma separated), BRIDGE_TOKEN, PEER,
      HEAD_CACHE_MB (default 10), HEAD_CACHE_FILES (default 12)
 """
 import asyncio
+import hashlib
+import hmac
 import logging
 import os
 import re
@@ -140,6 +142,32 @@ async def shutdown():
 
 def _auth(token):
     return (not BRIDGE_TOKEN) or token == BRIDGE_TOKEN
+
+
+def _auth_signed(msg_id, exp, sig, token):
+    """Accept either the shared token OR a short-lived HMAC signature.
+
+    The site is static and streams straight from here now, so the browser must
+    carry proof-of-access in the URL. Shipping BRIDGE_TOKEN to the browser would
+    leak a permanent credential, so the API worker signs
+
+        HMAC-SHA256(BRIDGE_TOKEN, f'{msg_id}:{exp}')
+
+    and the URL carries only `exp` + `sig`. The secret never leaves the two
+    servers, and a leaked link dies at `exp`.
+    """
+    if _auth(token):
+        return True
+    if not (BRIDGE_TOKEN and exp and sig):
+        return False
+    try:
+        if int(exp) < int(time.time()):
+            return False
+    except (TypeError, ValueError):
+        return False
+    want = hmac.new(BRIDGE_TOKEN.encode(), f'{msg_id}:{exp}'.encode(),
+                    hashlib.sha256).hexdigest()
+    return hmac.compare_digest(want, sig)
 
 
 @app.api_route('/', methods=['GET', 'HEAD'])
@@ -328,10 +356,10 @@ async def _get_head(worker, peer, msg_id, media, size):
 
 @app.api_route('/stream/{msg_id}', methods=['GET', 'HEAD'])
 async def stream(msg_id: int, request: Request, peer: str = '', token: str = '',
-                 dl: int = 0):
+                 dl: int = 0, exp: str = '', sig: str = ''):
     """Range-capable byte stream. dl=1 sets an attachment disposition."""
     _stats['requests'] += 1
-    if not _auth(token):
+    if not _auth_signed(msg_id, exp, sig, token):
         return Response('unauthorized', status_code=401)
     worker = pick()
     if worker is None:
@@ -415,13 +443,14 @@ async def stream(msg_id: int, request: Request, peer: str = '', token: str = '',
 
 
 @app.get('/warm/{msg_id}')
-async def warm(msg_id: int, peer: str = '', token: str = ''):
+async def warm(msg_id: int, peer: str = '', token: str = '', exp: str = '',
+               sig: str = ''):
     """Prefetch a file's head into cache so playback starts instantly.
 
     The site calls this when a watch page opens and for the next lesson, so the
     5-7 MB moov atom is already in memory before Play is pressed.
     """
-    if not _auth(token):
+    if not _auth_signed(msg_id, exp, sig, token):
         return Response('unauthorized', status_code=401)
     worker = pick()
     if worker is None:
@@ -440,9 +469,10 @@ async def warm(msg_id: int, peer: str = '', token: str = ''):
 
 
 @app.get('/thumb/{msg_id}')
-async def thumb(msg_id: int, peer: str = '', token: str = ''):
+async def thumb(msg_id: int, peer: str = '', token: str = '', exp: str = '',
+                sig: str = ''):
     """Poster image for a video (Telegram already stores thumbnails)."""
-    if not _auth(token):
+    if not _auth_signed(msg_id, exp, sig, token):
         return Response('unauthorized', status_code=401)
     worker = pick()
     if worker is None:
