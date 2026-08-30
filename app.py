@@ -316,6 +316,14 @@ async def _parallel_head(peer, msg_id, size, want):
     return b''.join(parts)
 
 
+async def _fill_head_bg(worker, peer, msg_id, media, size):
+    """Populate the head cache without anyone waiting on it."""
+    try:
+        await _get_head(worker, peer, msg_id, media, size)
+    except Exception as e:
+        log.info('bg head %s: %s', msg_id, type(e).__name__)
+
+
 async def _get_head(worker, peer, msg_id, media, size):
     """Cache the first HEAD_MB of a file: ftyp + moov (5-7 MB here) + opening
     seconds. This is what removes the wait before the first frame.
@@ -408,16 +416,23 @@ async def stream(msg_id: int, request: Request, peer: str = '', token: str = '',
         return Response(status_code=416, headers={**base, 'Content-Range': f'bytes */{size}'})
     want = end - start + 1
 
-    # Serve the opening bytes from the in-memory head whenever the request
-    # starts inside that window - including a plain full-file GET, which is what
-    # a browser issues first. Previously this only applied to small ranges, so
-    # the common case still waited on Telegram.
-    head = None
-    if start < HEAD_MB * MB:
-        try:
-            head = await _get_head(worker, target, msg_id, media, size)
-        except Exception as e:
-            log.info('head cache miss %s: %s', msg_id, type(e).__name__)
+    # OPENING BYTES.
+    #
+    # Previously this AWAITED _get_head() on a miss, so the very first request for
+    # a file blocked until a whole 10 MB head had been assembled - measured 8.8 s
+    # TTFB on a cold file versus 0.69 s once cached. The viewer paid for the cache
+    # that only helps later requests.
+    #
+    # Now: use the head only if it is ALREADY in memory. On a miss, start
+    # streaming the requested bytes straight away and build the head in the
+    # background, so the next request (a seek, or the next Range the browser
+    # issues) hits a warm cache and nobody ever waits for it.
+    head = _heads.get((str(target), msg_id))
+    if head is not None:
+        _heads.move_to_end((str(target), msg_id))
+        _stats['head_hits'] += 1
+    elif start < HEAD_MB * MB:
+        asyncio.create_task(_fill_head_bg(worker, target, msg_id, media, size))
 
     async def sender():
         if head is not None and start < len(head):
