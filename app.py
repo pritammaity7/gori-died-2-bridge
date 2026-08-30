@@ -183,10 +183,29 @@ async def _media(worker, peer, msg_id, force=False):
     msgs = await worker.get_messages(peer, ids=[msg_id])
     if not msgs or not msgs[0] or not msgs[0].media:
         return None, 0, '', ''
-    media = msgs[0].media
+    m = msgs[0]
+    media = m.media
     media = getattr(media, 'document', None) or getattr(media, 'photo', None) or media
     size = getattr(media, 'size', 0) or 0
     mime = getattr(media, 'mime_type', '') or 'application/octet-stream'
+
+    # PHOTOS: a Photo object has no .size - the byte length lives on the largest
+    # PhotoSize. Leaving size at 0 made the range check below reject every photo
+    # with HTTP 416, which the site then reported as "all bridges unavailable"
+    # and no image ever loaded.
+    if not size:
+        best = 0
+        for s in (getattr(media, 'sizes', None) or []):
+            best = max(best, getattr(s, 'size', 0) or 0)
+            for chunk in (getattr(s, 'sizes', None) or []):
+                if isinstance(chunk, int):
+                    best = max(best, chunk)
+        if not best:
+            best = getattr(getattr(m, 'file', None), 'size', 0) or 0
+        size = best
+        if mime == 'application/octet-stream':
+            mime = 'image/jpeg'
+
     name = ''
     for a in getattr(media, 'attributes', []) or []:
         if hasattr(a, 'file_name'):
@@ -194,6 +213,7 @@ async def _media(worker, peer, msg_id, force=False):
             break
     _meta[key] = (time.time(), media, size, mime, name)
     return media, size, mime, name
+
 
 
 
